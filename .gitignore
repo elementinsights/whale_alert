@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+*.so
+
+# Virtual environment
+venv/
+env/
+.env
+*.env
+
+# Logs & state
+*.log
+whale_alert_state.json
+price_track_state.json
+
+# Google service account keys
+service_account.json
+*.pem
+*.p12
+
+# OS / IDE cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Bytecode & cache
+*.egg-info/
+.eggs/
+.cache/
+.pytest_cache/
+
+# Build / dist
+build/
+dist/
+*.egg
+*.whl
