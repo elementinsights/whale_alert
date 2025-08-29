@@ -2,35 +2,38 @@
 # -*- coding: utf-8 -*-
 
 """
-Whale Alerts Runner (Telegram + Google Sheets) — with per-coin thresholds,
-exchange+symbol params for Large Orderbook endpoint, and post-alert price tracking.
-
-New: Price Tracking Columns
-- After each appended alert row, we create a tracker that records % change
-  vs. the baseline price at scheduled checkpoints:
-  1,2,3,4,5 minutes; then every 5m to 30m; then every 15m to 3h;
-  then every 30m to 12h; then every 60m to 24h.
+Whale Alerts Runner (Telegram + Google Sheets) — resilient version
+- Multi-host fallback for CoinGlass (v4 -> legacy) and a retrying session.
+- Per-coin thresholds, exchange+symbol LOB params, and post-alert price tracking.
+- %Δ tracking is baselined off the LIVE mark price at alert time (not the whale's entry).
+- Telegram and Sheets keep BOTH values: Entry vs Mark@.
 
 Live price sources (in order): Binance (USDT), Coinbase (USD).
 
-ENV (same as before unless noted):
+ENV:
   COINGLASS_API_KEY (required)
+
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID (or TELEGRAM_CHANNEL)
   ALERT_TAG (optional)
+
   GOOGLE_SHEETS_ID (required for Sheets logging)
   GOOGLE_SHEETS_TAB (default 'Alerts')
   GOOGLE_SA_JSON (path to service account JSON; file must be shared with the SA email)
   GSHEET_WEBHOOK_URL (optional fallback for appends)
 
   WATCH_COINS            default: "BTC,ETH,SOL,XRP,DOGE,LINK"
-  INTERVAL_S             default: 30
+  INTERVAL_S             default: 60
   HL_ENABLED             default: true
   LOB_ENABLED            default: true
   MIN_NOTIONAL_USD       default: 1000000
   EXCHANGES              default: "" (blank = all)
   DEDUPE_TTL_MIN         default: 180
   PER_REQUEST_PAUSE      default: 0.25
+
+  # Optional base overrides:
+  COINGLASS_BASE          default: https://open-api-v4.coinglass.com
+  COINGLASS_FALLBACK_BASE default: https://open-api.coinglass.com
 
 Optional per-coin threshold overrides:
   MIN_NOTIONAL_BTC, MIN_NOTIONAL_ETH, MIN_NOTIONAL_SOL, MIN_NOTIONAL_XRP, ...
@@ -45,19 +48,27 @@ from collections import deque
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Delete price tracking state file at startup
-STATE_FILE = "price_track_state.json"
-if os.path.exists(STATE_FILE):
-    os.remove(STATE_FILE)
-    print(f"[info] Deleted old {STATE_FILE}")
-
-
-# Load .env from the script directory explicitly (works no matter your CWD)
+# ---------- Startup housekeeping ----------
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=SCRIPT_DIR / ".env", override=True)
 
+# Delete price tracking state file at startup (fresh run)
+TRACK_FILE = str(SCRIPT_DIR / "price_track_state.json")
+if os.path.exists(TRACK_FILE):
+    try:
+        os.remove(TRACK_FILE)
+        print(f"[info] Deleted old {Path(TRACK_FILE).name}")
+    except Exception as e:
+        print(f"[warn] Could not delete old {Path(TRACK_FILE).name}: {e}")
+
+STATE_FILE = str(SCRIPT_DIR / "whale_alert_state.json")  # reserved for future use
+
 # ---------- Config ----------
-API_HOST = "https://open-api-v4.coinglass.com"
+API_HOSTS = [
+    os.getenv("COINGLASS_BASE", "https://open-api-v4.coinglass.com").rstrip("/"),
+    os.getenv("COINGLASS_FALLBACK_BASE", "https://open-api.coinglass.com").rstrip("/"),
+]
+
 ENDPOINT_HL_ALERT = "/api/hyperliquid/whale-alert"
 ENDPOINT_LOB_HIST = "/api/futures/orderbook/large-limit-order-history"
 
@@ -66,7 +77,7 @@ DEFAULT_WATCH = [
     for c in os.getenv("WATCH_COINS", "BTC,ETH,SOL,XRP,DOGE,LINK").split(",")
     if c.strip()
 ]
-INTERVAL_S = int(os.getenv("INTERVAL_S", "30"))
+INTERVAL_S = int(os.getenv("INTERVAL_S", "60"))
 HL_ENABLED = os.getenv("HL_ENABLED", "true").strip().lower() in ("1","true","yes","on")
 LOB_ENABLED = os.getenv("LOB_ENABLED", "true").strip().lower() in ("1","true","yes","on")
 EXCH_FILTER = {e.strip() for e in os.getenv("EXCHANGES", "").split(",") if e.strip()}
@@ -75,9 +86,6 @@ PER_REQUEST_PAUSE = float(os.getenv("PER_REQUEST_PAUSE", "0.25"))
 
 PRICE_POLL_TIMEOUT_S = int(os.getenv("PRICE_POLL_TIMEOUT_S", "8"))
 PRICE_COOLDOWN_S     = float(os.getenv("PRICE_COOLDOWN_S", "2"))
-
-STATE_FILE = str(SCRIPT_DIR / "whale_alert_state.json")
-TRACK_FILE = str(SCRIPT_DIR / "price_track_state.json")
 
 # ---------- Per-coin thresholds ----------
 DEFAULT_MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "1000000"))
@@ -89,15 +97,16 @@ MIN_NOTIONAL_BY_SYMBOL = {
     "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "20000000")),
     "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "20000000")),
     "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "20000000")),
-    # add more if you want defaults in-code
 }
 
 def min_notional_for(symbol: str) -> float:
     sym = (symbol or "").upper()
     v = os.getenv(f"MIN_NOTIONAL_{sym}")
     if v:
-        try: return float(v)
-        except: pass
+        try:
+            return float(v)
+        except Exception:
+            pass
     return float(MIN_NOTIONAL_BY_SYMBOL.get(sym, DEFAULT_MIN_NOTIONAL_USD))
 
 def effective_thresholds_for_watchlist():
@@ -110,7 +119,7 @@ def now_utc() -> dt.datetime:
 def fmt_usd(x):
     try:
         x = float(x)
-        return f"${x:,.0f}" if abs(x) >= 1000 else f"${x:,.2f}"
+        return f"${x:,.0f}" if abs(x) >= 1000 else f"${x:,.4f}" if abs(x) < 1 else f"${x:,.2f}"
     except Exception:
         return str(x)
 
@@ -123,17 +132,43 @@ def get_api_key() -> str:
         raise RuntimeError("Missing COINGLASS_API_KEY in .env")
     return k
 
+# ---------- HTTP session with retries + host fallback ----------
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_SESSION = requests.Session()
+_RETRY = Retry(
+    total=2, connect=2, read=2,
+    backoff_factor=0.4,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=False
+)
+_SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY))
+
 def http_get(path, params=None, timeout=20):
-    url = f"{API_HOST}{path}"
+    """
+    Try each host in API_HOSTS until one succeeds.
+    Handles CoinGlass JSON envelope: {"code": "0", "data": ...}
+    """
     headers = {"CG-API-KEY": get_api_key(), "accept": "application/json"}
-    r = requests.get(url, headers=headers, params=params or {}, timeout=timeout)
-    try:
-        j = r.json()
-    except Exception:
-        j = {}
-    if r.status_code != 200 or str(j.get("code")) != "0":
-        raise RuntimeError(f"HTTP {r.status_code} / code={j.get('code')} / msg={j.get('msg')} / params={params}")
-    return j.get("data", [])
+    last_err = None
+    for host in API_HOSTS:
+        url = f"{host}{path}"
+        try:
+            r = _SESSION.get(url, headers=headers, params=params or {}, timeout=timeout)
+            try:
+                j = r.json()
+            except Exception:
+                j = {}
+            if r.status_code == 200 and str(j.get("code")) == "0":
+                return j.get("data", [])
+            if r.status_code in (401, 403):
+                raise RuntimeError(f"Auth/plan error {r.status_code}: {j.get('msg') or r.text}")
+            last_err = RuntimeError(f"HTTP {r.status_code} / code={j.get('code')} / msg={j.get('msg')} / params={params}")
+        except requests.exceptions.RequestException as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"All CoinGlass hosts failed for {path}: {last_err}")
 
 # ---------- Telegram ----------
 def send_telegram(text: str) -> bool:
@@ -151,51 +186,47 @@ def send_telegram(text: str) -> bool:
     try:
         r = requests.post(url, json=payload, timeout=15)
         ok = (r.status_code == 200 and r.json().get("ok") is True)
-        if not ok: print("[error] Telegram send failed:", r.text, flush=True)
+        if not ok:
+            print("[error] Telegram send failed:", r.text, flush=True)
         return ok
     except Exception as e:
         print("[error] Telegram exception:", e, flush=True)
         return False
 
 def telegram_lines(evt, utc_now):
-    # Header
     lines = ["🐳🐳🐳 <b>¡¡¡ALERTA BALLENA!!!</b> 🐳🐳🐳"]
-
-    # Coin / Exchange
     if evt.get("symbol"):
         lines.append(f"Coin: {evt['symbol']}")
     if evt.get("exchange"):
         lines.append(f"Exchange: {evt['exchange']}")
-
-    # Address (shortened 0x1234...abcd)
     if evt.get("address"):
         addr = evt["address"]
         short = addr[:6] + "..." + addr[-4:]
         lines.append(f"Address: <code>{short}</code>")
 
-    # Core fields
-    lines += [
-        f"Action: {evt['action']}",
-        f"Notional: {fmt_usd(evt['notional'])} • Size: {evt['size']}",
-        f"Price: {fmt_usd(evt['price'])}",
-        f"UTC: {utc_now}",
-    ]
+    lines.append(f"Action: {evt['action']}")
+    lines.append(f"Notional: {fmt_usd(evt['notional'])} • Size: {evt['size']}")
 
-    # Link label changed to Transaction
+    entry = evt.get("entry_price")
+    mark  = evt.get("price")  # 'price' is Mark@ alert time
+    if entry is not None or mark is not None:
+        if entry is not None and mark is not None:
+            lines.append(f"Entry: {fmt_usd(entry)} • Mark@: {fmt_usd(mark)}")
+        elif mark is not None:
+            lines.append(f"Mark@: {fmt_usd(mark)}")
+        else:
+            lines.append(f"Entry: {fmt_usd(entry)}")
+
+    lines.append(f"UTC: {utc_now}")
     if evt.get("url"):
         lines.append(f"Transaction: {evt['url']}")
-
-    # Optional note
     if evt.get("note"):
         lines.append(f"Note: {evt['note']}")
-
     return "\n".join(lines)
-
 
 # ---------- Google Sheets ----------
 HEADER_ROW = 1
 
-# Build all tracker headers we will fill
 def build_tracker_minutes():
     mins = [1,2,3,4,5]
     mins += list(range(10, 31, 5))             # 10,15,20,25,30
@@ -205,12 +236,17 @@ def build_tracker_minutes():
     return mins
 
 TRACK_MINUTES = build_tracker_minutes()
-TRACK_HEADERS = [f"%Δ {m}m" if m < 60 else (f"%Δ {m//60}h" if m % 60 == 0 else f"%Δ {m}m") for m in TRACK_MINUTES]
+TRACK_HEADERS = [
+    f"%Δ {m}m" if m < 60 else (f"%Δ {m//60}h" if m % 60 == 0 else f"%Δ {m}m")
+    for m in TRACK_MINUTES
+]
 
-BASE_HEADERS = ["Date","Time","Source","Exchange","Address","Symbol","Action","Size","Price","Liq/Side","NotionalUSD","Note","URL"]
+# IMPORTANT: Price column is the Mark@ alert time; Entry is the whale's cost basis/fill.
+BASE_HEADERS = ["Date","Time","Source","Exchange","Address","Symbol","Action",
+                "Size","Price","Entry","Liq/Side","NotionalUSD","Note","URL"]
 SHEET_HEADERS = BASE_HEADERS + TRACK_HEADERS + ["UID"]
 
-TRACK_COL_OFFSET = len(BASE_HEADERS)           # first %Δ column index (0-based within headers list)
+TRACK_COL_OFFSET = len(BASE_HEADERS)
 
 def _get_gspread_client():
     load_dotenv(dotenv_path=SCRIPT_DIR / ".env", override=False)
@@ -269,7 +305,6 @@ def append_rows(rows):
             return False
 
 def find_row_by_uid(uid_val):
-    """Finds row number (1-based) for the given UID. Returns None if not found."""
     gc, sh, ws = _get_sheet_handles()
     if not ws: return None
     try:
@@ -279,17 +314,15 @@ def find_row_by_uid(uid_val):
         return None
 
 def update_pct_cell(uid_val, minutes_from_start, pct_value):
-    """Write the % change into the appropriate %Δ column for a given UID."""
     gc, sh, ws = _get_sheet_handles()
     if not ws: return False
     try:
-        # map minutes to header index
         try:
             idx = TRACK_MINUTES.index(minutes_from_start)
         except ValueError:
             return False
-        col_index = TRACK_COL_OFFSET + idx  # 0-based in header list
-        sheet_col = col_index + 1           # 1-based for Sheets
+        col_index = TRACK_COL_OFFSET + idx
+        sheet_col = col_index + 1
         row = find_row_by_uid(uid_val)
         if not row: return False
         ws.update_cell(row, sheet_col, f"{pct_value:.2f}%")
@@ -308,16 +341,17 @@ def to_sheet_row(evt, utc_dt, uid_val):
         evt["symbol"],
         evt["action"],
         evt["size"],
-        evt["price"],
+        evt.get("price"),           # Mark@ at alert time
+        evt.get("entry_price"),     # Whale's entry/fill
         evt["liq_or_side"],
         evt["notional"],
         evt["note"],
         evt["url"],
-        *[""] * len(TRACK_HEADERS),  # placeholder cells for %Δ columns
+        *[""] * len(TRACK_HEADERS),
         uid_val
     ]
 
-# ---------- Dedupe ----------
+# ---------- Dedupe (in-memory TTL) ----------
 class SeenCache:
     def __init__(self, ttl_min=180, maxlen=6000):
         self.ttl = ttl_min * 60
@@ -367,6 +401,7 @@ def fetch_hl_whale_alerts():
         action = "Open" if act_code == 1 else ("Close" if act_code == 2 else f"Act{act_code}")
         ts_ms = int(e.get("create_time", 0) or 0)
         url = f"https://www.coinglass.com/hyperliquid/{e.get('user')}"
+
         out.append({
             "source": "Hyperliquid Whale Alert",
             "exchange": "Hyperliquid",
@@ -374,7 +409,8 @@ def fetch_hl_whale_alerts():
             "symbol": sym,
             "action": f"{action} {side}",
             "size": size,
-            "price": float(e.get("entry_price", 0) or 0),
+            "price": None,  # Mark@ will be fetched live
+            "entry_price": float(e.get("entry_price", 0) or 0),
             "liq_or_side": f"Liq {float(e.get('liq_price', 0) or 0):,.2f}",
             "notional": notional,
             "note": "",
@@ -404,7 +440,7 @@ def fetch_large_orderbook_fills():
                 if DEFAULT_WATCH and base_asset not in DEFAULT_WATCH:
                     continue
                 state = int(e.get("order_state", 0) or 0)
-                if state != 2:
+                if state != 2:  # 2 = filled
                     continue
                 notional = float(e.get("start_usd_value", 0) or 0)
                 if notional < min_notional_for(base_asset):
@@ -414,7 +450,6 @@ def fetch_large_orderbook_fills():
                 ts_ms = int(e.get("order_end_time") or e.get("current_time") or e.get("start_time") or 0)
                 price = float(e.get("price", 0) or 0)
                 size = float(e.get("start_quantity", 0) or 0)
-                # derive price if missing
                 if price <= 0 and size:
                     price = notional / abs(size)
 
@@ -425,7 +460,8 @@ def fetch_large_orderbook_fills():
                     "symbol": base_asset,
                     "action": side_lab,
                     "size": size,
-                    "price": price,
+                    "price": None,                 # Mark@ fetched live
+                    "entry_price": price,          # Treat fill price as entry
                     "liq_or_side": side_lab.split()[0],  # 'Buy' or 'Sell'
                     "notional": notional,
                     "note": e.get("symbol", ""),
@@ -438,7 +474,6 @@ def fetch_large_orderbook_fills():
 # ---------- Price polling (Binance → Coinbase fallback) ----------
 def fetch_price_now(symbol: str):
     s = (symbol or "").upper()
-
     # 1) Binance USDT
     try:
         r = requests.get(
@@ -453,7 +488,6 @@ def fetch_price_now(symbol: str):
     except Exception:
         pass
     time.sleep(PRICE_COOLDOWN_S)
-
     # 2) Coinbase USD
     try:
         r = requests.get(
@@ -466,8 +500,7 @@ def fetch_price_now(symbol: str):
             if p > 0: return p
     except Exception:
         pass
-
-    return None  # unknown/unsupported
+    return None
 
 # ---------- Tracking state ----------
 def load_track_state():
@@ -475,7 +508,7 @@ def load_track_state():
         with open(TRACK_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {"items": []}  # list of trackers
+        return {"items": []}
 
 def save_track_state(state):
     try:
@@ -493,7 +526,7 @@ def schedule_tracker(uid_val, symbol, base_price, start_ts):
         "symbol": symbol.upper(),
         "p0": float(base_price),
         "t0": float(start_ts),
-        "due": build_checkpoint_minutes(),  # remaining minutes to write
+        "due": build_checkpoint_minutes(),
         "done": []
     }
 
@@ -502,14 +535,10 @@ def process_trackers():
     if not state["items"]: return
     now_ts = time.time()
     changed = False
-
-    # iterate a copy so we can mutate safely
     for tr in list(state["items"]):
-        # check next due checkpoints (in ascending order)
         still_due = []
         for m in tr["due"]:
             if now_ts - tr["t0"] >= m * 60 - 1:  # small tolerance
-                # fetch live price & write cell
                 p = fetch_price_now(tr["symbol"])
                 if p:
                     pct = (p - tr["p0"]) / tr["p0"] * 100.0
@@ -519,35 +548,33 @@ def process_trackers():
                         changed = True
                     time.sleep(PRICE_COOLDOWN_S)
                 else:
-                    # keep it due; we’ll try again next loop
                     still_due.append(m)
             else:
                 still_due.append(m)
         tr["due"] = still_due
-
-        # drop tracker if finished (nothing left due)
         if not tr["due"]:
             state["items"].remove(tr)
             changed = True
-
     if changed:
         save_track_state(state)
 
 # ---------- Main loop ----------
 def run_loop():
     seen = SeenCache(ttl_min=DEDUP_TTL_MIN)
-    print("=== Whale Alerts Runner ===", flush=True)
+    print("=== Whale Alerts Runner (resilient) ===", flush=True)
     thr = effective_thresholds_for_watchlist()
     thr_str = ", ".join(f"{k}:{fmt_usd(v)}" for k,v in thr.items())
+    print(f"API hosts: {', '.join(API_HOSTS)}", flush=True)
     print(f"Watchlist: {', '.join(DEFAULT_WATCH)}", flush=True)
     print(f"Per-coin thresholds: {thr_str} | fallback(default)={fmt_usd(DEFAULT_MIN_NOTIONAL_USD)}", flush=True)
     print(f"Interval={INTERVAL_S}s | enabled: HL={HL_ENABLED} LOB={LOB_ENABLED}", flush=True)
     print(f"Exchange filter: {', '.join(sorted(EXCH_FILTER)) if EXCH_FILTER else '(all defaults)'}", flush=True)
     print("Price tracking enabled: will fill %Δ columns up to 24h.\n", flush=True)
 
-    # ensure header exists (and columns) at startup
+    # ensure header exists at startup
     _ = _get_sheet_handles()
-    if _[2]: ensure_headers(_[2])
+    if _[2]:
+        ensure_headers(_[2])
 
     while True:
         utc_dt = now_utc()
@@ -555,41 +582,59 @@ def run_loop():
         staged = []
         trackers_to_stage = []
 
+        # Hyperliquid whale alerts
         try:
             if HL_ENABLED:
                 for evt in fetch_hl_whale_alerts():
                     key = ("HL", evt["address"], evt["symbol"], evt["action"], round(evt["notional"]))
                     if not seen.seen(key):
+                        # Fetch live mark price; store to event; build note
+                        mark = fetch_price_now(evt["symbol"])
+                        if mark is not None:
+                            evt["price"] = mark  # Price column = Mark@
+                        if evt.get("entry_price") is not None and mark is not None:
+                            note = evt.get("note") or ""
+                            if note: note += " | "
+                            evt["note"] = note + f"Entry {fmt_usd(evt['entry_price'])} vs Mark {fmt_usd(mark)}"
+
                         send_telegram(telegram_lines(evt, utc_now))
                         u = uid()
                         staged.append(to_sheet_row(evt, utc_dt, u))
-                        # baseline price
-                        p0 = evt["price"] if float(evt["price"] or 0) > 0 else (evt["notional"]/abs(evt["size"]) if evt["size"] else None)
-                        if p0:
-                            trackers_to_stage.append(schedule_tracker(u, evt["symbol"], p0, time.time()))
+
+                        if mark is not None:
+                            trackers_to_stage.append(schedule_tracker(u, evt["symbol"], mark, evt["ts"]))
                         seen.add(key)
         except Exception as e:
             print(f"{utc_now} | HL fetch error: {e}", flush=True)
 
+        # Large orderbook filled orders
         try:
             if LOB_ENABLED:
                 for evt in fetch_large_orderbook_fills():
                     key = ("LOB", evt["exchange"], evt["symbol"], evt["action"], round(evt["notional"]), int(evt["ts"]//60))
                     if not seen.seen(key):
+                        mark = fetch_price_now(evt["symbol"])
+                        if mark is not None:
+                            evt["price"] = mark
+                        if evt.get("entry_price") is not None and mark is not None:
+                            note = evt.get("note") or ""
+                            if note: note += " | "
+                            evt["note"] = note + f"Entry {fmt_usd(evt['entry_price'])} vs Mark {fmt_usd(mark)}"
+
                         send_telegram(telegram_lines(evt, utc_now))
                         u = uid()
                         staged.append(to_sheet_row(evt, utc_dt, u))
-                        p0 = evt["price"] if float(evt["price"] or 0) > 0 else (evt["notional"]/abs(evt["size"]) if evt["size"] else None)
-                        if p0:
-                            trackers_to_stage.append(schedule_tracker(u, evt["symbol"], p0, time.time()))
+
+                        if mark is not None:
+                            trackers_to_stage.append(schedule_tracker(u, evt["symbol"], mark, evt["ts"]))
                         seen.add(key)
         except Exception as e:
             print(f"{utc_now} | LOB fetch error: {e}", flush=True)
 
+        # Append to Sheets + persist trackers
         if staged:
             ok = append_rows(staged)
             if ok:
-                # persist trackers only after rows land
                 st = load_track_state()
                 st["items"].extend(trackers_to_stage)
                 save_track_state(st)
@@ -597,7 +642,7 @@ def run_loop():
             else:
                 print(f"{utc_now} | sheet append failed (trackers not saved)", flush=True)
 
-        # run trackers (fills %Δ cells that are due)
+        # Process due trackers (fill %Δ columns)
         try:
             process_trackers()
         except Exception as e:
@@ -607,7 +652,7 @@ def run_loop():
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Whale Alerts Runner (Telegram + Sheets + Price Tracking)")
+    ap = argparse.ArgumentParser(description="Whale Alerts Runner (Telegram + Sheets + Price Tracking) — resilient")
     ap.add_argument("--once", action="store_true", help="Run one iteration then exit (for testing)")
     args = ap.parse_args()
 
@@ -619,19 +664,34 @@ def main():
 
         if HL_ENABLED:
             for evt in fetch_hl_whale_alerts():
+                # Fetch live mark for baseline and logging
+                mark = fetch_price_now(evt["symbol"])
+                if mark is not None:
+                    evt["price"] = mark
+                    evt["note"] = (evt.get("note") or "")
+                    if evt["note"]: evt["note"] += " | "
+                    if evt.get("entry_price") is not None:
+                        evt["note"] += f"Entry {fmt_usd(evt['entry_price'])} vs Mark {fmt_usd(mark)}"
                 print(evt)
                 u = uid()
                 staged.append(to_sheet_row(evt, utc_dt, u))
-                p0 = evt["price"] if float(evt["price"] or 0) > 0 else (evt["notional"]/abs(evt["size"]) if evt["size"] else None)
-                if p0: trackers_to_stage.append(schedule_tracker(u, evt["symbol"], p0, time.time()))
+                if mark is not None:
+                    trackers_to_stage.append(schedule_tracker(u, evt["symbol"], mark, evt["ts"]))
 
         if LOB_ENABLED:
             for evt in fetch_large_orderbook_fills():
+                mark = fetch_price_now(evt["symbol"])
+                if mark is not None:
+                    evt["price"] = mark
+                    evt["note"] = (evt.get("note") or "")
+                    if evt["note"]: evt["note"] += " | "
+                    if evt.get("entry_price") is not None:
+                        evt["note"] += f"Entry {fmt_usd(evt['entry_price'])} vs Mark {fmt_usd(mark)}"
                 print(evt)
                 u = uid()
                 staged.append(to_sheet_row(evt, utc_dt, u))
-                p0 = evt["price"] if float(evt["price"] or 0) > 0 else (evt["notional"]/abs(evt["size"]) if evt["size"] else None)
-                if p0: trackers_to_stage.append(schedule_tracker(u, evt["symbol"], p0, time.time()))
+                if mark is not None:
+                    trackers_to_stage.append(schedule_tracker(u, evt["symbol"], mark, evt["ts"]))
 
         if staged:
             append_rows(staged)

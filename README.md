@@ -106,6 +106,45 @@ Stop with `Ctrl-C`.
 
 ---
 
+## Server Commands
+
+### Login
+```bash
+ssh -i ~/.ssh/heatmap_do heatmap@206.189.79.36
+```
+
+
+### Upload Files
+```bash
+rsync -avz --progress \
+  --exclude '.venv/' --exclude 'venv/' --exclude '__pycache__/' \
+  -e "ssh -i ~/.ssh/heatmap_do" \
+  whale_alert_runner.py .env service_account.json \
+  heatmap@206.189.79.36:/home/heatmap/whale-alert/
+```
+
+### Reload and Start
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now whale-alert.service
+journalctl --user -u whale-alert -f
+```
+
+### Logs
+```bash
+journalctl --user -u whale-alert -f
+```
+
+### Start on Server
+```bash
+sudo systemctl start whale-alert
+```
+
+### Modify System File
+```bash
+sudo nano /etc/systemd/system/whale-alert.service
+```
+
 ## Google Sheets Setup
 
 - Share your target Google Sheet with the **Service Account email** from your JSON key.  
