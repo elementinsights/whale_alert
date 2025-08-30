@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Whale Alerts Runner (Telegram + Google Sheets) — HL-only, entry-time & no-backfill (+lag +debug)
-- Hyperliquid whale alerts only (executed opens/closes).
-- Shows the trade's execution time (Hyperliquid create_time) in Telegram + Sheets.
-- Ignores historical alerts prior to script start, but allows a small server-lag window.
-- Read-quota friendly: single startup read; write-only thereafter.
-- Tracks %Δ vs LIVE market price over time.
-- Debug prints show how many events were fetched each cycle (and a few samples).
+Whale Alerts Runner (Telegram + Google Sheets)
+- Sources (configurable):
+  • Hyperliquid whale alerts (executed opens/closes)  → HL_ENABLED
+  • Binance/Bybit large limit order FILLS (executed)  → CEX_ENABLED + EXCHANGES
+- Shows execution time (create/end time) in Telegram + Sheets.
+- No backfill, but allows small server-lag window (ALLOWED_LAG_S).
+- Sheets writes are quota-friendly; %Δ tracked vs LIVE Market Price.
 
 ENV:
   COINGLASS_API_KEY (required)
@@ -23,10 +23,16 @@ ENV:
   GSHEET_WEBHOOK_URL (optional fallback for appends)
 
   WATCH_COINS            default: "BTC,ETH,SOL,XRP,DOGE,LINK"
-  INTERVAL_S             default: 60
+  INTERVAL_S             default: 20
   MIN_NOTIONAL_USD       default: 1000000
+  MIN_NOTIONAL_<SYMBOL>  overrides per coin (e.g. MIN_NOTIONAL_ETH)
   DEDUP_TTL_MIN          default: 180
-  ALLOWED_LAG_S          default: 120   # accept events up to this many seconds before script start
+  ALLOWED_LAG_S          default: 120
+
+  # Source toggles + filters
+  HL_ENABLED             default: true
+  CEX_ENABLED            default: true
+  EXCHANGES              default: ""   (blank = all supported; else comma list e.g. "Binance,Bybit")
 
   PRICE_POLL_TIMEOUT_S   default: 8
   PRICE_COOLDOWN_S       default: 2
@@ -52,8 +58,7 @@ if os.path.exists(TRACK_FILE):
     except Exception as e:
         print(f"[warn] Could not delete old {Path(TRACK_FILE).name}: {e}")
 
-# Capture script start time (seconds since epoch, UTC); used to ignore historical alerts
-SCRIPT_START_TS = time.time()
+SCRIPT_START_TS = time.time()  # used to ignore historical alerts
 
 # ---------- Config ----------
 API_HOSTS = [
@@ -61,29 +66,44 @@ API_HOSTS = [
     os.getenv("COINGLASS_FALLBACK_BASE", "https://open-api.coinglass.com").rstrip("/"),
 ]
 ENDPOINT_HL_ALERT = "/api/hyperliquid/whale-alert"
+ENDPOINT_LOB_HIST = "/api/futures/orderbook/large-limit-order-history"
 
 DEFAULT_WATCH = [
     c.strip().upper()
     for c in os.getenv("WATCH_COINS", "BTC,ETH,SOL,XRP,DOGE,LINK").split(",")
     if c.strip()
 ]
-INTERVAL_S = int(os.getenv("INTERVAL_S", "20"))
-DEDUP_TTL_MIN = int(os.getenv("DEDUP_TTL_MIN", "180"))
-ALLOWED_LAG_S = int(os.getenv("ALLOWED_LAG_S", "120"))
-
+INTERVAL_S      = int(os.getenv("INTERVAL_S", "20"))
+DEDUP_TTL_MIN   = int(os.getenv("DEDUP_TTL_MIN", "180"))
+ALLOWED_LAG_S   = int(os.getenv("ALLOWED_LAG_S", "60"))
 PRICE_POLL_TIMEOUT_S = int(os.getenv("PRICE_POLL_TIMEOUT_S", "8"))
 PRICE_COOLDOWN_S     = float(os.getenv("PRICE_COOLDOWN_S", "2"))
+
+# Source toggles
+def _env_bool(k, default=True):
+    return os.getenv(k, str(default)).strip().lower() in ("1","true","yes","on")
+HL_ENABLED  = _env_bool("HL_ENABLED", True)
+CEX_ENABLED = _env_bool("CEX_ENABLED", True)
+
+# Exchange filter (for CEX)
+SUPPORTED_CEX = ["Binance", "Bybit"]
+EXCH_FILTER = [e.strip() for e in os.getenv("EXCHANGES", "").split(",") if e.strip()]
+if EXCH_FILTER:
+    # keep only supported
+    EXCH_FILTER = [e for e in EXCH_FILTER if e in SUPPORTED_CEX]
+else:
+    EXCH_FILTER = SUPPORTED_CEX[:]  # default = all supported
 
 # ---------- Thresholds ----------
 DEFAULT_MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "1000000"))
 MIN_NOTIONAL_BY_SYMBOL = {
-    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "1000")),
-    "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "1000")),
-    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "1000")),
-    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "1000")),
-    "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "1000")),
-    "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "1000")),
-    "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "1000")),
+    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "100000000")),
+    "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "50000000")),
+    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "50000000")),
+    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "50000000")),
+    "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "20000000")),
+    "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "20000000")),
+    "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "20000000")),
 }
 
 def min_notional_for(symbol: str) -> float:
@@ -124,7 +144,7 @@ def get_api_key() -> str:
     return k
 
 def shorten_hl_url(url: str) -> str:
-    # Display https://www.coinglass.com/hyperliquid/0x9...fc4
+    # https://www.coinglass.com/hyperliquid/0x9...fc4
     try:
         base, addr = url.rsplit("/", 1)
         if len(addr) > 8:
@@ -192,14 +212,13 @@ def send_telegram(text: str) -> bool:
         return False
 
 def telegram_lines(evt):
-    # Use execution timestamp (evt['ts'])
-    entry_date, entry_time = fmt_ts(evt["ts"])
+    entry_date, entry_time = fmt_ts(evt["ts"])  # execution time
     lines = ["🐳🐳🐳 <b>¡ALERTA BALLENA!</b> 🐳🐳🐳"]
-    lines.append(f"Coin: {evt['symbol']}")
+    lines.append(f"Coin: {evt['symbol']} on {evt['exchange']}")
     lines.append(f"Action: {evt['action']}")
     lines.append(f"Notional: {fmt_usd(evt['notional'])} | Size: {evt['size']}")
     entry = evt.get("entry_price")
-    mark  = evt.get("price")  # Market Price at alert time
+    mark  = evt.get("price")
     if entry is not None or mark is not None:
         if entry is not None and mark is not None:
             lines.append(f"Entry: {fmt_usd(entry)} | Market Price: {fmt_usd(mark)}")
@@ -207,13 +226,14 @@ def telegram_lines(evt):
             lines.append(f"Market Price: {fmt_usd(mark)}")
         else:
             lines.append(f"Entry: {fmt_usd(entry)}")
-    lines.append(f"UTC: {entry_date} at {entry_time}")  # execution time
+    lines.append(f"UTC: {entry_date} at {entry_time}")
     if evt.get("url"):
-        disp = shorten_hl_url(evt["url"])
-        lines.append(f'Transaction: <a href="{evt["url"]}">{disp}</a>')
+        disp = shorten_hl_url(evt["url"]) if "hyperliquid" in evt["url"] else evt["url"]
+        lines.append(f'<a href="{evt["url"]}">Transaction</a>' if "hyperliquid" not in evt["url"]
+                     else f'Transaction: <a href="{evt["url"]}">{disp}</a>')
     return "\n".join(lines)
 
-# ---------- Google Sheets (read-quota friendly) ----------
+# ---------- Google Sheets ----------
 HEADER_ROW = 1
 BASE_HEADERS = [
     "Date","Time","Exchange","Symbol","Action",
@@ -379,7 +399,7 @@ class SeenCache:
             k,_ = self.buf.popleft()
             self.set.pop(k, None)
 
-# ---------- Hyperliquid fetch ----------
+# ---------- Fetchers ----------
 def fetch_hl_whale_alerts():
     data = http_get(ENDPOINT_HL_ALERT)
     out = []
@@ -400,18 +420,79 @@ def fetch_hl_whale_alerts():
 
         out.append({
             "exchange": "Hyperliquid",
-            "address": e.get("user",""),  # internal for dedupe only
+            "address": e.get("user",""),           # internal for dedupe only
             "symbol": sym,
             "action": f"{action} {side}",
             "size": size,
-            "price": None,                       # Market Price filled later
+            "price": None,                         # Market Price fetched live
             "entry_price": float(e.get("entry_price", 0) or 0),
             "liq_or_side": f"Liq {float(e.get('liq_price', 0) or 0):,.2f}",
             "notional": notional,
-            "ts": ts_seconds,                    # execution time (seconds)
+            "ts": ts_seconds,
             "url": url
         })
     return out
+
+def default_futures_symbol(base: str, exchange: str) -> str:
+    base = (base or "").upper()
+    ex = (exchange or "").lower()
+    if ex in ("binance","okx","bybit","bitget","kucoin","huobi"):
+        return f"{base}USDT"
+    if ex in ("coinbase","kraken","deribit"):
+        return f"{base}USD"
+    return f"{base}USDT"
+
+def fetch_cex_filled_orders():
+    if not CEX_ENABLED:
+        return []
+    out_all = []
+    for exch in EXCH_FILTER:
+        for base in DEFAULT_WATCH:
+            symbol = default_futures_symbol(base, exch)
+            params = {"exchange": exch, "symbol": symbol}
+            try:
+                data = http_get(ENDPOINT_LOB_HIST, params=params)
+            except Exception as e:
+                print(f"[warn] LOB fetch failed for {exch} {symbol}: {e}", flush=True)
+                continue
+
+            for e in data or []:
+                base_asset = str(e.get("base_asset", "")).upper()
+                if DEFAULT_WATCH and base_asset not in DEFAULT_WATCH:
+                    continue
+                state = int(e.get("order_state", 0) or 0)
+                if state != 2:  # 2 = filled/executed
+                    continue
+
+                notional = float(e.get("start_usd_value", 0) or 0)
+                if notional < min_notional_for(base_asset):
+                    continue
+
+                side = int(e.get("order_side", 0) or 0)
+                side_lab = "Buy (bid filled)" if side == 2 else "Sell (ask filled)" if side == 1 else f"Side{side}"
+
+                ts_ms = int(e.get("order_end_time") or e.get("current_time") or e.get("start_time") or 0)
+                ts_seconds = ts_ms/1000 if ts_ms else time.time()
+                price = float(e.get("price", 0) or 0)
+                size = float(e.get("start_quantity", 0) or 0)
+                if price <= 0 and size:
+                    price = notional / abs(size)
+
+                out_all.append({
+                    "exchange": exch,
+                    "address": "",                   # internal for dedupe parity
+                    "symbol": base_asset,
+                    "action": side_lab,
+                    "size": size,
+                    "price": None,                   # Market Price fetched live
+                    "entry_price": price,            # treat fill price as entry
+                    "liq_or_side": side_lab.split()[0],  # 'Buy' or 'Sell'
+                    "notional": notional,
+                    "ts": ts_seconds,
+                    "url": ""                        # no per-fill URL
+                })
+            time.sleep(0.15)
+    return out_all
 
 # ---------- Price polling ----------
 def fetch_price_now(symbol: str):
@@ -501,7 +582,7 @@ def process_trackers():
     if changed:
         save_track_state(state)
 
-# ---------- Row assembly (uses execution time) ----------
+# ---------- Row assembly ----------
 def to_sheet_row(evt, uid_val):
     date_str, time_str = fmt_ts(evt["ts"])
     return [
@@ -523,30 +604,40 @@ def to_sheet_row(evt, uid_val):
 # ---------- Main loop ----------
 def run_loop():
     seen = SeenCache(ttl_min=DEDUP_TTL_MIN)
-    print("=== Whale Alerts Runner (HL-only, entry-time, no-backfill +lag +debug) ===", flush=True)
+    print("=== Whale Alerts Runner (configurable sources) ===", flush=True)
     thr = effective_thresholds_for_watchlist()
     thr_str = ", ".join(f"{k}:{fmt_usd(v)}" for k,v in thr.items())
     print(f"API hosts: {', '.join(API_HOSTS)}", flush=True)
     print(f"Watchlist: {', '.join(DEFAULT_WATCH)}", flush=True)
     print(f"Per-coin thresholds: {thr_str} | fallback(default)={fmt_usd(DEFAULT_MIN_NOTIONAL_USD)}", flush=True)
-    print(f"Interval={INTERVAL_S}s | AllowedLag={ALLOWED_LAG_S}s", flush=True)
+    print(f"Interval={INTERVAL_S}s | AllowedLag={ALLOWED_LAG_S}s | HL={HL_ENABLED} | CEX={CEX_ENABLED} [{', '.join(EXCH_FILTER)}]", flush=True)
     print("Price tracking enabled: will fill %Δ columns up to 24h.\n", flush=True)
 
     while True:
         staged = []
 
         try:
-            events = fetch_hl_whale_alerts()
-            print(f"[debug] fetched {len(events)} HL events")
-            for e in events[:3]:
-                print("[debug] sample:", e.get("symbol"), e.get("notional"), e.get("ts"))
+            hl_events = []
+            if HL_ENABLED:
+                hl_events = fetch_hl_whale_alerts()
+                print(f"[debug] fetched {len(hl_events)} HL events")
+                for e in hl_events[:3]:
+                    print("[debug] HL sample:", e.get("symbol"), e.get("notional"), e.get("ts"))
 
-            for evt in events:
-                # Ignore events older than script start, but allow small lag tolerance
-                if evt["ts"] < SCRIPT_START_TS - ALLOWED_LAG_S:
+            cex_events = []
+            if CEX_ENABLED:
+                cex_events = fetch_cex_filled_orders()
+                print(f"[debug] fetched {len(cex_events)} CEX events ({', '.join(EXCH_FILTER)})")
+                for e in cex_events[:3]:
+                    print("[debug] CEX sample:", e.get("exchange"), e.get("symbol"), e.get("notional"), e.get("ts"))
+
+            for evt in hl_events + cex_events:
+                cutoff = SCRIPT_START_TS - ALLOWED_LAG_S
+                if evt["ts"] < cutoff:
                     continue
 
-                key = ("HL", evt["address"], evt["symbol"], evt["action"], round(evt["notional"]), int(evt["ts"] // 60))
+                key = ("HL" if evt["exchange"] == "Hyperliquid" else "LOB",
+                       evt.get("exchange"), evt["symbol"], evt["action"], round(evt["notional"]), int(evt["ts"] // 60))
                 if seen.seen(key):
                     continue
 
@@ -559,7 +650,7 @@ def run_loop():
                 staged.append((evt, u))
                 seen.add(key)
         except Exception as e:
-            print(f"HL fetch error: {e}", flush=True)
+            print(f"[error] fetch loop: {e}", flush=True)
 
         if staged:
             rows = [to_sheet_row(evt, u) for (evt, u) in staged]
@@ -585,19 +676,22 @@ def run_loop():
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Whale Alerts Runner — HL-only, entry-time, no-backfill +lag +debug")
+    ap = argparse.ArgumentParser(description="Whale Alerts Runner — configurable sources (HL / Binance / Bybit)")
     ap.add_argument("--once", action="store_true", help="Run one iteration then exit (for testing)")
     args = ap.parse_args()
 
     if args.once:
         try:
-            events = fetch_hl_whale_alerts()
-            print(f"[debug] fetched {len(events)} HL events (--once)")
-            for e in events[:5]:
-                print("[debug] sample:", e.get("symbol"), e.get("notional"), e.get("ts"))
             staged = []
-            for evt in events:
-                if evt["ts"] < SCRIPT_START_TS - ALLOWED_LAG_S:
+            hl_events = fetch_hl_whale_alerts() if HL_ENABLED else []
+            cex_events = fetch_cex_filled_orders() if CEX_ENABLED else []
+            print(f"[debug] (--once) HL={len(hl_events)} | CEX={len(cex_events)} [{', '.join(EXCH_FILTER)}]")
+            for e in hl_events[:5]: print("[debug] HL sample:", e.get("symbol"), e.get("notional"), e.get("ts"))
+            for e in cex_events[:5]: print("[debug] CEX sample:", e.get("exchange"), e.get("symbol"), e.get("notional"), e.get("ts"))
+
+            cutoff = SCRIPT_START_TS - ALLOWED_LAG_S
+            for evt in hl_events + cex_events:
+                if evt["ts"] < cutoff:
                     continue
                 mark = fetch_price_now(evt["symbol"])
                 if mark is not None:
@@ -618,7 +712,7 @@ def main():
                             )
                     save_track_state(state)
         except Exception as e:
-            print("HL fetch error (--once):", e, flush=True)
+            print("fetch error (--once):", e, flush=True)
         print("Done.")
     else:
         run_loop()
