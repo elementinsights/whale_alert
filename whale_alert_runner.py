@@ -97,13 +97,13 @@ else:
 # ---------- Thresholds ----------
 DEFAULT_MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "1000000"))
 MIN_NOTIONAL_BY_SYMBOL = {
-    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "100000000")),
-    "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "50000000")),
-    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "50000000")),
-    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "50000000")),
-    "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "20000000")),
-    "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "20000000")),
-    "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "20000000")),
+    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "1000")),
+    "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "500")),
+    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "500")),
+    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "500")),
+    "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "200")),
+    "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "200")),
+    "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "200")),
 }
 
 def min_notional_for(symbol: str) -> float:
@@ -212,25 +212,27 @@ def send_telegram(text: str) -> bool:
         return False
 
 def telegram_lines(evt):
-    entry_date, entry_time = fmt_ts(evt["ts"])  # execution time
-    lines = ["🐳🐳🐳 <b>¡ALERTA BALLENA!</b> 🐳🐳🐳"]
-    lines.append(f"Coin: {evt['symbol']} on {evt['exchange']}")
+    entry_date, entry_time = fmt_ts(evt["ts"])
+    lines = [f"🐳 <b>WHALE ALERT</b>"]
+    lines.append(f"Coin: {evt['symbol']}")
     lines.append(f"Action: {evt['action']}")
-    lines.append(f"Notional: {fmt_usd(evt['notional'])} | Size: {evt['size']}")
+    lines.append(f"Notional: <b>{fmt_usd(evt['notional'])}</b> | Size: {evt['size']:.3f}")
+    
     entry = evt.get("entry_price")
     mark  = evt.get("price")
-    if entry is not None or mark is not None:
-        if entry is not None and mark is not None:
-            lines.append(f"Entry: {fmt_usd(entry)} | Market Price: {fmt_usd(mark)}")
-        elif mark is not None:
-            lines.append(f"Market Price: {fmt_usd(mark)}")
-        else:
-            lines.append(f"Entry: {fmt_usd(entry)}")
-    lines.append(f"UTC: {entry_date} at {entry_time}")
+    if entry is not None and mark is not None:
+        lines.append(f"Entry: {fmt_usd(entry)} | Mkt: {fmt_usd(mark)}")
+    elif mark is not None:
+        lines.append(f"Mkt: {fmt_usd(mark)}")
+    elif entry is not None:
+        lines.append(f"Entry: {fmt_usd(entry)}")
+    
+    lines.append(f"UTC: {entry_date} {entry_time}")
+    
     if evt.get("url"):
         disp = shorten_hl_url(evt["url"]) if "hyperliquid" in evt["url"] else evt["url"]
-        lines.append(f'<a href="{evt["url"]}">Transaction</a>' if "hyperliquid" not in evt["url"]
-                     else f'Transaction: <a href="{evt["url"]}">{disp}</a>')
+        lines.append(f'<a href="{evt["url"]}">Tx</a>')
+    
     return "\n".join(lines)
 
 # ---------- Google Sheets ----------
