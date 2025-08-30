@@ -97,10 +97,10 @@ else:
 # ---------- Thresholds ----------
 DEFAULT_MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "1000000"))
 MIN_NOTIONAL_BY_SYMBOL = {
-    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "100000000")),
+    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "50000000")),
     "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "50000000")),
-    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "50000000")),
-    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "50000000")),
+    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "30000000")),
+    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "30000000")),
     "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "20000000")),
     "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "20000000")),
     "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "20000000")),
