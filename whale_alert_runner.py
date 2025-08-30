@@ -97,13 +97,13 @@ else:
 # ---------- Thresholds ----------
 DEFAULT_MIN_NOTIONAL_USD = float(os.getenv("MIN_NOTIONAL_USD", "1000000"))
 MIN_NOTIONAL_BY_SYMBOL = {
-    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "1000")),
-    "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "500")),
-    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "500")),
-    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "500")),
-    "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "200")),
-    "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "200")),
-    "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "200")),
+    "BTC": float(os.getenv("MIN_NOTIONAL_BTC", "100000000")),
+    "ETH": float(os.getenv("MIN_NOTIONAL_ETH", "50000000")),
+    "SOL": float(os.getenv("MIN_NOTIONAL_SOL", "50000000")),
+    "XRP": float(os.getenv("MIN_NOTIONAL_XRP", "50000000")),
+    "DOGE": float(os.getenv("MIN_NOTIONAL_DOGE", "20000000")),
+    "LINK": float(os.getenv("MIN_NOTIONAL_LINK", "20000000")),
+    "HYPE": float(os.getenv("MIN_NOTIONAL_HYPE", "20000000")),
 }
 
 def min_notional_for(symbol: str) -> float:
@@ -230,9 +230,12 @@ def telegram_lines(evt):
     lines.append(f"UTC: {entry_date} {entry_time}")
     
     if evt.get("url"):
-        disp = shorten_hl_url(evt["url"]) if "hyperliquid" in evt["url"] else evt["url"]
-        lines.append(f'<a href="{evt["url"]}">Tx</a>')
-    
+    try:
+        txid = evt["url"].rstrip("/").split("/")[-1]
+    except Exception:
+        txid = "Tx"
+    lines.append(f'"Link: <a href="{evt["url"]}">{txid}</a>')
+
     return "\n".join(lines)
 
 # ---------- Google Sheets ----------
